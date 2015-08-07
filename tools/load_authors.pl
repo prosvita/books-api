@@ -10,25 +10,45 @@ use Data::Dumper;
 
 use 5.010;
 
+my $command = shift @ARGV;
+
 use JSON -convert_blessed_universally;
 use Getopt::Long;
 use Pod::Usage;
 use WWW::Curl::Easy;
 use URI::Escape;
 use Hash::Merge::Simple qw/merge/;
+use Data::Match qw/:all/;
+use Data::Clone;
+use Scalar::Util qw/refaddr/;
 
 =encoding utf8
 
 =head1 NAME
 
-load_authors.pl — команда завантажує або оновлює інформацію про авторів з wikipedia.org
+authors.pl — команда завантажує або оновлює інформацію про авторів з wikipedia.org
 
 =head1 SYNOPSIS
 
-    ./load_authors.pl \
+authors.pl [COMMAND] OPTIONS
+
+  where COMMAND := { load | update }
+        OPTIONS := { --from FILE {input-file} | --to {output-file} |
+                     --lang {lang} | --langs {list of langs} | --category {string} |
+                     --find {json-text} | --add {json-text} |
+                     --help }
+
+=head2 SAMPLES
+
+    ./authors.pl load \
         --from old.json --to new.json \
         --lang uk --langs=ru,en,crh \
         --category 'Категорія:Українські поети'
+
+    ./authors.pl update \
+        --from old.json --to new.json \
+        --find '{"uk":"Руданський Степан Васильович"}' \
+        --add '{"tags":[{"uk":"Українські класики"}]}'
 
 =head1 DESCRIPTION
 
@@ -40,13 +60,13 @@ load_authors.pl — команда завантажує або оновлює і
           "name" : {
              "uk" : "Руданський Степан Васильович",
              "ru" : "Руданский, Степан Васильевич"
-          },                
-          "wiki" : {        
+          },
+          "wiki" : {
              "uk" : "https://uk.wikipedia.org/wiki/Руданський Степан Васильович",
              "ru" : "https://ru.wikipedia.org/wiki/Руданский, Степан Васильевич"
-          },                
-          "tags" : [        
-             {              
+          },
+          "tags" : [
+             {
                 "uk" : "Українські поети",
                 "en" : "Ukrainian poets",
                 "ru" : "Поэты Украины"
@@ -66,7 +86,7 @@ load_authors.pl — команда завантажує або оновлює і
 =item --to
 
 Файл у форматі JSON, в який будуть збережені результати.
-Обов'язкова опція.
+Якщо опція не вказана, то результат виводиться у STDOUT.
 
 =item --lang
 
@@ -83,6 +103,22 @@ load_authors.pl — команда завантажує або оновлює і
 Вказується повна назва категорії з wikipedia.org для завантаження списку авторів.
 Обов'язкова опція.
 
+=item --find JSON
+
+=item --add JSON
+
+=item --change JSON
+
+TODO
+
+=item --delete JSON
+
+TODO
+
+=item --remove
+
+TODO
+
 =back
 
 =cut
@@ -95,12 +131,15 @@ my $url_template_info_url = 'https://{lang}.wikipedia.org/w/api.php?action=query
 my $curl;
 
 my @langs;
-my $to_file;
+my $to_file = '&STDOUT';
 my $lang;
 my $category_title;
 
 my $authors = [];
 my $authors_index;
+
+my @targets;
+my @actions;
 
 GetOptions(
     'from=s'        => \&load_json,
@@ -108,15 +147,23 @@ GetOptions(
     'lang=s'        => \$lang,
     'category=s'    => \$category_title,
     'langs=s'       => \@langs,
+    'find=s@'       => \&set_target,
+    'add=s'         => \&set_action,
     'help|?'        => sub { pod2usage(0) }
 );
 
 # Нормалізуємо список мов
-@langs = split(/,/,join(',',@langs));
+@langs = split(/,/, join(',', @langs));
 unshift(@langs, $lang)
-    unless ($lang ~~ @langs);
+    unless $lang ~~ @langs;
 
-if (defined $lang && defined $category_title && defined $to_file) {
+if (defined $command && $command eq 'load') {
+
+    pod2usage(-message => "Options --lang LANG and --category TITLE are required.",
+              -exitval => 2,
+              -verbose => 0,
+              -output  => \*STDERR)
+        unless defined $lang || defined $category_title;
 
     init_curl();
 
@@ -124,16 +171,59 @@ if (defined $lang && defined $category_title && defined $to_file) {
         lang => $lang,
         titles => $category_title});
 
-    open DATA, ">".$to_file || die $!;
-    print DATA JSON->new->allow_blessed->convert_blessed->utf8->pretty->encode($authors);
-    close DATA;
+    save_json($to_file, $authors);
+
+} elsif (defined $command && $command eq 'update') {
+
+    pod2usage(-message => "Option --from FILE are required.",
+              -exitval => 2,
+              -verbose => 0,
+              -output  => \*STDERR)
+        unless exists $authors->[0];
+
+    pod2usage(-message => "You must specify one of the options --add JSON, --change JSON, --delete JSON or --remove.",
+              -exitval => 2,
+              -verbose => 0,
+              -output  => \*STDERR)
+        unless @actions;
+
+    pod2usage(-message => "Use --find '{}' to perform an action on all elements.",
+              -exitval => 2,
+              -verbose => 0,
+              -output  => \*STDERR)
+        unless @targets;
+
+    pod2usage(-message => "In the incoming file data is missing.",
+              -exitval => 2,
+              -verbose => 0,
+              -output  => \*STDERR)
+        unless scalar(@{$authors});
+
+    my $target_idx = find_targets(\@targets);
+
+    for (@{$target_idx}) {
+        my $member = $authors->[$_];
+        print "$_";
+        foreach my $lang (keys %{$member->{name}}) {
+            print " [$lang]".$member->{name}->{$lang};
+        }
+        print "\n";
+    }
 
 } else {
-    pod2usage(-message => "Something wrong.",
+    pod2usage(-message => "The first argument must be a COMMAND.",
               -exitval => 2,
               -verbose => 0,
               -output  => \*STDERR);
 }
+
+exit;
+
+=head1 FUNCTIONS
+
+=head2 load_json($file)
+
+=cut
 
 sub load_json {
     shift;
@@ -152,6 +242,128 @@ sub load_json {
         ++$i;
     }
 }
+
+=head2 save_json($file, $data)
+
+=cut
+
+sub save_json {
+    my ($file, $data) = @_;
+
+    open(DATA, ">".$file) || die $!;
+    print DATA JSON->new->allow_blessed->convert_blessed->utf8->pretty->encode($data);
+    close(DATA);
+}
+
+=head2 set_target($json_text)
+
+=cut
+
+sub set_target {
+    push(@targets, JSON->new->utf8->decode($_[1]));
+}
+
+=head2 set_action($json_text)
+
+=cut
+
+sub set_action {
+    push(@actions, {$_[0], JSON->new->utf8->decode($_[1])});
+}
+
+=head2 find_targets(\@targets)
+
+Шукає в $authors м'які збіги, задані опціями --find {текст з JSON},
+та повертає масив з індексами входжень в $authors.
+
+=cut
+
+sub find_targets {
+    my ($targets) = @_;
+    my @result;
+
+    foreach my $target (@{$targets}) {
+
+        pod2usage(-message => "Options --find '".JSON->new->utf8->encode($target)."' must be string of HASH.",
+                  -exitval => 2,
+                  -verbose => 0,
+                  -output  => \*STDERR)
+            unless ref($target) eq 'HASH';
+
+        my @keys = keys %{$target};
+
+        if ($#keys == -1) {
+            # Передали порожній хеш: --find '{}'
+
+            @result = ();
+            foreach (0..scalar(@{$authors})-1) {
+                push(@result, $_);
+            }
+            last;
+        }
+
+        my $pattern = inject_REST($target);
+
+        my $idx = 0;
+        foreach my $author (@{$authors}) {
+            if (matches($author, $pattern)) {
+                push(@result, $idx);
+            }
+            $idx++;
+        }
+
+    }
+
+    # Потрібно залишити унікальні індекси
+    my %seen = ();
+    my @unique = grep { ! $seen{$_}++ } @result;
+
+    return \@unique;
+}
+
+=head2 inject_REST($pattern)
+
+Інкапсулює об'єкти L<Data::Match> структури для м'якого пошуку методом C<matches>.
+Повертає клон структури з інкапсульованими методами C<REST>.
+
+=cut
+
+sub inject_REST {
+    my $pattern = clone(shift);
+    my @queue = ($pattern);
+    my %seen = ();
+
+    my %WALK = (
+        HASH => sub {
+            my ($obj) = @_;
+            foreach (keys %{$obj}) {
+                push @queue, $obj->{$_};
+            }
+            $obj->{REST()} = REST();
+        },
+        ARRAY => sub {
+            my ($obj) = @_;
+            foreach (@{$obj}) {
+                push @queue, $_;
+            }
+            push(@{$obj}, REST());
+        }
+    );
+
+    while (my $obj = shift @queue) {
+        my $ref = ref $obj;
+        if ($ref && ($ref eq 'ARRAY' or $ref eq 'HASH')) {
+            $WALK{$ref}->($obj)
+                unless ($seen{refaddr $obj}++);
+        }
+    }
+
+    return $pattern;
+}
+
+=head2 update_authors
+
+=cut
 
 sub update_authors {
     my ($authors, $params) = @_;
@@ -219,6 +431,10 @@ sub update_authors {
     }
 }
 
+=head2 get_categorymembers
+
+=cut
+
 sub get_categorymembers {
     my ($params) = @_;
     my $members = {};
@@ -256,6 +472,10 @@ sub get_categorymembers {
     return $members;
 }
 
+=head2 get_author_info
+
+=cut
+
 sub get_author_info {
     my ($result, $params) = @_;
 
@@ -270,6 +490,10 @@ sub get_author_info {
         $result->{$pageid}->{wiki}->{$params->{lang}} = $data->{query}->{pages}->{$pageid}->{fullurl};
     }
 }
+
+=head2 get_page_langs
+
+=cut
 
 sub get_page_langs {
     my ($params) = @_;
@@ -292,6 +516,10 @@ sub get_page_langs {
     return $result;
 }
 
+=head2 init_curl
+
+=cut
+
 sub init_curl {
     $curl = new WWW::Curl::Easy->new;
     $curl->setopt(CURLOPT_FOLLOWLOCATION, 1);
@@ -299,6 +527,10 @@ sub init_curl {
     $curl->setopt(CURLOPT_COOKIEJAR, '');
     $curl->setopt(CURLOPT_USERAGENT, 'sharedBooks/0.0.1 (http://SB.TLD/; levonet@gmail.com)');
 }
+
+=head2 get_curl_data
+
+=cut
 
 sub get_curl_data {
     my ($url_template, $params) = @_;
@@ -331,6 +563,10 @@ sub get_curl_data {
     return $data;
 }
 
+=head2 check_wiki_error
+
+=cut
+
 sub check_wiki_error {
     my ($data) = @_;
 
@@ -341,6 +577,10 @@ sub check_wiki_error {
     }
 }
 
+=head2 check_wiki_data
+
+=cut
+
 sub check_wiki_data {
     my ($data, $test) = @_;
 
@@ -350,6 +590,10 @@ sub check_wiki_data {
         exit -1;
     }
 }
+
+=head2 unescape
+
+=cut
 
 sub unescape {
     my $src = shift;
